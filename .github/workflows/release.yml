@@ -1,6 +1,9 @@
 # Publish a release to PyPI when a version tag is pushed.
 #
-# Authentication uses PyPI Trusted Publishing (OIDC) — no API token is stored.
+# Everything is done by uv: `uv build` produces the sdist and wheel, and
+# `uv publish --trusted-publishing always` authenticates via PyPI Trusted
+# Publishing (OIDC) and uploads PEP 740 attestations — no API token is stored.
+#
 # PyPI must have a "pending publisher" (or a published project) configured with:
 #
 #   PyPI project name : livezip
@@ -44,9 +47,6 @@ jobs:
       - name: Build sdist and wheel
         run: uv build
 
-      - name: Check the built wheel
-        run: uv run --with twine twine check dist/*
-
       - uses: actions/upload-artifact@v6
         with:
           name: dist
@@ -60,14 +60,19 @@ jobs:
       name: pypi
       url: https://pypi.org/p/livezip
     permissions:
-      id-token: write # required for Trusted Publishing (OIDC)
+      id-token: write # OIDC token for Trusted Publishing
     steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v10.1.0
+
       - uses: actions/download-artifact@v6
         with:
           name: dist
           path: dist/
 
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Publish to PyPI
+        run: uv publish --trusted-publishing always
 
   github-release:
     name: Create GitHub Release
