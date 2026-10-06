@@ -1,118 +1,278 @@
+"""Byte-stream abstractions consumed by the storage layer.
+
+The point of :class:`DataStream` is to delay opening the underlying resource
+until the moment its bytes are actually needed. This is what allows
+:class:`livezip.encode.ZipEncoder` to describe an archive (and compute its final
+size) while holding only an O(1) descriptor per file, and to open/close sockets
+one at a time rather than all at once.
+"""
+
 from abc import ABC, abstractmethod
-from typing import BinaryIO, Callable, Optional, Text, Union
+from collections.abc import Callable, Iterator
+from pathlib import Path
+from typing import TYPE_CHECKING, BinaryIO
 from urllib.request import urlopen
+
+if TYPE_CHECKING:
+    from http.client import HTTPResponse
 
 
 class DataStream(ABC):
     """
-    Basic interface of a class that will allow you to stream data into a zip
-    file. Everything is asynchronous.
+    Asynchronous-friendly interface for a stream of bytes.
+
+    Implementations are opened right before being read and closed right after,
+    so that resources such as files or HTTP connections are only held while the
+    encoder is working on that particular entry.
     """
 
     @abstractmethod
     def open(self) -> None:
         """
-        Use this to open whichever resources you need to open
+        Acquire whichever resources are needed for reading.
         """
-
-        raise NotImplementedError
 
     @abstractmethod
     def read(self, length: int) -> bytes:
         """
-        Allows to read the next X bytes from the stream. It's important to
-        respect the length parameter: each call should read exactly
-        `min(remaining_data, length)` bytes.
+        Read at most ``length`` bytes.
 
         Parameters
         ----------
         length
-            Number of bytes to return
+            Maximum number of bytes to return.
 
         Returns
         -------
-        `length` bytes or less if that's the end of the stream
+        bytes
+            Up to ``length`` bytes, or an empty value at end of stream.
         """
-
-        raise NotImplementedError
 
     @abstractmethod
     def close(self) -> None:
         """
-        Use this to close the resources you need to close
+        Release whichever resources :meth:`open` acquired.
         """
 
-        raise NotImplementedError
-
-
-class UrlStream(DataStream):
-    """
-    Streams the content found at the specified URL.
-    """
-
-    #: urlopen() timeout, in seconds
-    TIMEOUT = 5
-
-    def __init__(self, url: Callable[[], Text]):
+    def read_exact(self, length: int) -> bytes:
         """
-        Constructs the object
+        Read exactly ``length`` bytes unless the stream ends first.
+
+        ``DataStream.read`` implementations are only required to return *at
+        most* ``length`` bytes (that is the contract of a socket), so callers
+        that need a fixed-size buffer — the DEFLATE block writer, for instance —
+        use this helper to loop until the buffer is full.
 
         Parameters
         ----------
-        url
-            The URL parameter is a callable that will be evaluated at the
-            moment of `open()`.
-        """
-
-        self.url = url
-        self.r = None
-
-    def open(self) -> None:
-        """
-        Opens the specified URL for reading
-        """
-
-        self.r = urlopen(self.url(), timeout=self.TIMEOUT)
-
-    def read(self, size: int) -> bytes:
-        """
-        Reads size bytes from the HTTP request.
-
-        Parameters
-        ----------
-        size
-            Number of bytes to read.
+        length
+            Number of bytes to gather.
 
         Returns
         -------
-        `size` bytes or less if that's the last bytes from the stream.
+        bytes
+            ``length`` bytes, or fewer if the stream ended early.
         """
 
-        return self.r.read(size)
+        chunks = bytearray()
+        remaining = length
 
-    def close(self):
+        while remaining > 0:
+            chunk = self.read(remaining)
+            if not chunk:
+                break
+            chunks += chunk
+            remaining -= len(chunk)
+
+        return bytes(chunks)
+
+
+class BytesStream(DataStream):
+    """
+    Stream an in-memory ``bytes`` object.
+
+    Mostly useful for tests and for callers that already have the payload in
+    RAM; :meth:`open` rewinds so the stream can be read more than once.
+    """
+
+    def __init__(self, data: bytes):
         """
-        Freeing the client's resources
+        Construct the stream.
+
+        Parameters
+        ----------
+        data
+            The payload to serve.
         """
 
-        self.r.close()
+        self.data = data
+        self.offset = 0
+
+    def open(self) -> None:
+        """
+        Rewind the cursor to the beginning of the buffer.
+        """
+
+        self.offset = 0
+
+    def read(self, length: int) -> bytes:
+        """
+        Return the next ``length`` bytes of the buffer.
+
+        Parameters
+        ----------
+        length
+            Maximum number of bytes to return.
+
+        Returns
+        -------
+        bytes
+            The next slice of the payload.
+        """
+
+        chunk = self.data[self.offset : self.offset + length]
+        self.offset += len(chunk)
+        return chunk
+
+    def close(self) -> None:
+        """
+        Nothing to release: the buffer is owned by the caller.
+        """
 
 
 class FileStream(DataStream):
     """
-    Naive implementation of a file stream.
+    Stream the contents of a file on the local filesystem.
     """
 
-    def __init__(self, file_path: Union[Text, int]):
-        self.file_path = file_path
-        self.f: Optional[BinaryIO] = None
+    def __init__(self, file_path: str | Path):
+        """
+        Construct the stream.
+
+        Parameters
+        ----------
+        file_path
+            Path of the file to read.
+        """
+
+        self.file_path = Path(file_path)
+        self.file: BinaryIO | None = None
 
     def open(self) -> None:
-        self.f = open(self.file_path, "rb")
+        """
+        Open the file for binary reading.
+        """
+
+        self.file = self.file_path.open("rb")
 
     def read(self, length: int) -> bytes:
-        return self.f.read(length)
+        """
+        Read at most ``length`` bytes from the file.
+
+        Parameters
+        ----------
+        length
+            Maximum number of bytes to return.
+
+        Returns
+        -------
+        bytes
+            The read data.
+        """
+
+        if self.file is None:
+            msg = "the stream is not open"
+            raise RuntimeError(msg)
+
+        return self.file.read(length)
 
     def close(self) -> None:
-        if self.f:
-            self.f.close()
+        """
+        Close the file handle if it is open.
+        """
+
+        if self.file is not None:
+            self.file.close()
+            self.file = None
+
+
+class UrlStream(DataStream):
+    """
+    Stream the content found at the specified URL.
+    """
+
+    #: ``urlopen`` timeout, in seconds.
+    TIMEOUT = 30
+
+    def __init__(self, url: Callable[[], str]):
+        """
+        Construct the stream.
+
+        Parameters
+        ----------
+        url
+            A callable evaluated at :meth:`open` time. Deferring it allows the
+            caller to generate a time-limited signed URL only when the encoder
+            is about to read the bytes.
+        """
+
+        self.url = url
+        self.response: HTTPResponse | None = None
+
+    def open(self) -> None:
+        """
+        Perform the HTTP request.
+        """
+
+        self.response = urlopen(self.url(), timeout=self.TIMEOUT)  # noqa: S310
+
+    def read(self, length: int) -> bytes:
+        """
+        Read at most ``length`` bytes from the HTTP response body.
+
+        Parameters
+        ----------
+        length
+            Maximum number of bytes to return.
+
+        Returns
+        -------
+        bytes
+            The read data.
+        """
+
+        if self.response is None:
+            msg = "the stream is not open"
+            raise RuntimeError(msg)
+
+        return self.response.read(length)
+
+    def close(self) -> None:
+        """
+        Close the HTTP response.
+        """
+
+        if self.response is not None:
+            self.response.close()
+            self.response = None
+
+
+def iter_chunks(data: bytes, chunk_size: int) -> Iterator[bytes]:
+    """
+    Yield ``data`` in fixed-size chunks.
+
+    Parameters
+    ----------
+    data
+        Buffer to split.
+    chunk_size
+        Maximum size of each yielded chunk.
+
+    Yields
+    ------
+    bytes
+        Successive slices of ``data``.
+    """
+
+    for offset in range(0, len(data), chunk_size):
+        yield data[offset : offset + chunk_size]

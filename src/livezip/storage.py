@@ -1,6 +1,13 @@
+"""Storage strategies: how a file's bytes are laid out inside the archive.
+
+The :class:`CompactFile` contract is what makes the whole library predictable:
+the encoder must be able to tell, *before* reading a single byte, how long the
+stored payload will be. Every strategy below honours that contract.
+"""
+
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from struct import calcsize, pack
-from typing import Iterator
 from zlib import crc32
 
 from .models import CompressionMethod
@@ -9,82 +16,214 @@ from .stream import DataStream
 
 class CompactFile(ABC):
     """
-    Basic interface for a storage method. The idea is that we want to keep our
-    goal of having a predictable output size, however we also want to be able
-    to encode files in specific way. The goal of this interface is to notify
-    the encoder that the output is going to be of that specific length and that
-    the data is this. As long as you can respect this contract then it works.
+    Base interface for a storage method.
 
-    The intended purpose is to store the file as non-compressed deflate, which
-    allow to circumvent some Apple bugs (versus just non-compressed file).
-
-    If you wanted to have a compression method that really compresses then you
-    would need to compress the files beforehand and cache the compressed files,
-    then you could feed the compressed files into a custom storage.
+    The idea is to keep the promise of a predictable output size while still
+    letting the caller choose how files are encoded. As long as the compressed
+    size, the uncompressed size and the compression method are known up front,
+    and :meth:`get_data` yields exactly ``compressed_size`` bytes, the encoder
+    does not need to know anything else.
     """
 
     @property
     @abstractmethod
     def compressed_size(self) -> int:
         """
-        Number of bytes of the compressed data
-        """
+        Number of bytes of the stored (compressed) payload.
 
-        raise NotImplementedError
+        Returns
+        -------
+        int
+            Size of what :meth:`get_data` will yield.
+        """
 
     @property
     @abstractmethod
     def uncompressed_size(self) -> int:
         """
-        Number of bytes of the original data
-        """
+        Number of bytes of the original data.
 
-        raise NotImplementedError
+        Returns
+        -------
+        int
+            Size of the payload once decompressed.
+        """
 
     @property
     @abstractmethod
     def compression_method(self) -> CompressionMethod:
         """
-        Compression method to assign this to in the ZIP file.
-        """
+        Compression method to advertise in the ZIP entries.
 
-        raise NotImplementedError
+        Returns
+        -------
+        CompressionMethod
+            The method matching the bytes returned by :meth:`get_data`.
+        """
 
     @property
     @abstractmethod
     def crc32(self) -> int:
         """
-        Returns the CRC32 of the file, called only once `get_data()` ran.
-        """
+        CRC32 of the *uncompressed* data.
 
-        raise NotImplementedError
+        Returns
+        -------
+        int
+            The checksum. It is only guaranteed to be valid once
+            :meth:`get_data` has run to completion, except for strategies that
+            are given the checksum up front.
+        """
 
     @abstractmethod
     def get_data(self) -> Iterator[bytes]:
         """
-        Iterates over data chunks of arbitrary length
+        Iterate over the chunks that make up the stored payload.
+
+        Yields
+        ------
+        bytes
+            Successive chunks of arbitrary length.
         """
 
-        raise NotImplementedError
+
+class Store(CompactFile):
+    """
+    Copy the raw, uncompressed bytes verbatim.
+
+    This is the cheapest strategy: no framing, no CPU, no size growth. It is
+    ideal for already-compressed media (videos, JPEGs, ...) which would not
+    benefit from a second compression pass.
+    """
+
+    #: Read size used while streaming, in bytes.
+    READ_SIZE = 1024**2  # 1 MiB
+
+    def __init__(self, data: DataStream, size: int):
+        """
+        Construct the strategy.
+
+        Parameters
+        ----------
+        data
+            Stream producing the raw bytes.
+        size
+            Exact size of the data, in bytes.
+        """
+
+        self.data = data
+        self._size = size
+        self._crc32 = 0
+
+    @property
+    def compressed_size(self) -> int:
+        """
+        Raw data is not transformed, so both sizes are equal.
+
+        Returns
+        -------
+        int
+            The payload size.
+        """
+
+        return self._size
+
+    @property
+    def uncompressed_size(self) -> int:
+        """
+        Size of the original data.
+
+        Returns
+        -------
+        int
+            The payload size.
+        """
+
+        return self._size
+
+    @property
+    def compression_method(self) -> CompressionMethod:
+        """
+        The stored method.
+
+        Returns
+        -------
+        CompressionMethod
+            ``uncompressed``.
+        """
+
+        return CompressionMethod.uncompressed
+
+    @property
+    def crc32(self) -> int:
+        """
+        CRC32 computed while streaming.
+
+        Returns
+        -------
+        int
+            The checksum, valid once :meth:`get_data` has completed.
+        """
+
+        return self._crc32
+
+    def get_data(self) -> Iterator[bytes]:
+        """
+        Yield the raw bytes, computing the checksum along the way.
+
+        Yields
+        ------
+        bytes
+            Successive chunks of the payload.
+        """
+
+        self._crc32 = 0
+        self.data.open()
+
+        try:
+            remaining = self.uncompressed_size
+
+            while remaining > 0:
+                chunk = self.data.read_exact(min(self.READ_SIZE, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                self._crc32 = crc32(chunk, self._crc32)
+                yield chunk
+        finally:
+            self.data.close()
 
 
 class DeflateStore(CompactFile):
     """
-    Stores the data into DEFLATE format, only using non-compressed blocks.
+    Wrap the raw data in DEFLATE ``stored`` blocks.
 
-    Notes
-    -----
-    If you don't mind the small overhead, it's much simpler to decode for ZIP
-    tools and easier to recover if the file is corrupt because deflates lets
-    you know the size of the file (well more or less) so you don't have to
-    scan the whole file to find what comes next. Also some clients just don't
-    know how to do without it.
+    The bytes are not compressed, but they are framed as an RFC 1951 stream so
+    that tools expecting a DEFLATE payload are satisfied. This is a common
+    request for macOS and for clients that refuse "stored" entries without a
+    DEFLATE variant. The framing overhead is a predictable 5 bytes per 65535
+    byte block, so the output size remains known in advance.
     """
 
+    #: Maximum payload size of a DEFLATE ``stored`` block.
     BLOCK_SIZE = 0xFFFF
+    #: ``<BHH``: block header, LEN, one's complement of LEN.
     BLOCK_HEADER = "<BHH"
+    #: Final (and only, for empty input) empty ``stored`` block.
+    EMPTY_BLOCK = b"\x01\x00\x00\xff\xff"
 
     def __init__(self, data: DataStream, size: int):
+        """
+        Construct the strategy.
+
+        Parameters
+        ----------
+        data
+            Stream producing the raw bytes.
+        size
+            Exact size of the raw data, in bytes.
+        """
+
         self.data = data
         self._size = size
         self._crc32 = 0
@@ -92,19 +231,19 @@ class DeflateStore(CompactFile):
     @property
     def blocks(self) -> int:
         """
-        Number of blocks that will be output.
+        Number of DEFLATE blocks that will be emitted.
 
         Notes
         -----
-        As the deflate algorithm allows unlimited data streams, we're not sure
-        if the floating precision will be enough for our needs. That's why all
-        operations in that function leverage the arbitrary integer size of
-        Python and no operation is done in floating space. That's why we are
-        not using `ceil()` and implement it manually instead.
+        DEFLATE allows unlimited stream lengths, so rather than trusting
+        floating point precision the arithmetic is kept entirely in Python's
+        arbitrary-precision integers. Empty input still produces a single empty
+        final block, hence the ``max(1, ...)``.
 
-        While the size of the integer used here is unknown and could in theory
-        eat up a lot of memory if unchecked, the current hardware limitations
-        make it very unlikely that this integer goes beyond a few bytes.
+        Returns
+        -------
+        int
+            The number of blocks.
         """
 
         blocks = self._size // self.BLOCK_SIZE
@@ -112,101 +251,234 @@ class DeflateStore(CompactFile):
         if self._size % self.BLOCK_SIZE:
             blocks += 1
 
-        return blocks
+        return max(1, blocks)
 
     @property
     def compressed_size(self) -> int:
         """
-        Output size is the regular size of data plus the size of each block's
-        header
+        Size of the framed payload.
+
+        Returns
+        -------
+        int
+            Data size plus the header of each block.
         """
 
         return self.blocks * calcsize(self.BLOCK_HEADER) + self._size
 
     @property
     def uncompressed_size(self) -> int:
+        """
+        Size of the original data.
+
+        Returns
+        -------
+        int
+            The payload size.
+        """
+
         return self._size
 
     @property
     def compression_method(self) -> CompressionMethod:
+        """
+        The DEFLATE method.
+
+        Returns
+        -------
+        CompressionMethod
+            ``deflate``.
+        """
+
         return CompressionMethod.deflate
 
     @property
     def crc32(self) -> int:
         """
-        The CRC32 is computed during `get_data()`
+        CRC32 computed while streaming.
+
+        Returns
+        -------
+        int
+            The checksum, valid once :meth:`get_data` has completed.
         """
 
         return self._crc32
 
     def get_data(self) -> Iterator[bytes]:
         """
-        Yields all the data formatted inside proper DEFLATE blocks
+        Yield the data wrapped in DEFLATE ``stored`` blocks.
+
+        Yields
+        ------
+        bytes
+            Successive framed blocks.
         """
 
-        last_offset = (self.blocks - 1) * self.BLOCK_SIZE
-
+        self._crc32 = 0
         self.data.open()
 
         try:
-            for i in range(0, self.uncompressed_size, self.BLOCK_SIZE):
-                if i == last_offset:
-                    block_format = 0b00000001
-                else:
-                    block_format = 0b00000000
+            if self._size == 0:
+                yield self.EMPTY_BLOCK
+                return
 
-                data = self.data.read(self.BLOCK_SIZE)
-                args = [block_format, len(data), len(data) ^ self.BLOCK_SIZE]
-                header = pack(self.BLOCK_HEADER, *args)
+            last_offset = (self.blocks - 1) * self.BLOCK_SIZE
 
-                self._crc32 = crc32(data, self._crc32)
+            for offset in range(0, self.uncompressed_size, self.BLOCK_SIZE):
+                block_format = 0b00000001 if offset == last_offset else 0b00000000
+                chunk = self.data.read_exact(min(self.BLOCK_SIZE, self._size - offset))
+                header = pack(
+                    self.BLOCK_HEADER,
+                    block_format,
+                    len(chunk),
+                    len(chunk) ^ self.BLOCK_SIZE,
+                )
 
-                yield header + data
+                self._crc32 = crc32(chunk, self._crc32)
+
+                yield header + chunk
         finally:
             self.data.close()
-            del self.data
 
 
-class Store(CompactFile):
+class PrecompressedDeflate(CompactFile):
     """
-    Just stores the raw uncompressed file
+    Reuse an already DEFLATE-compressed payload.
+
+    This is the strategy to reach for when the data is *already* compressed —
+    for instance log files stored as ``*.deflate`` in an object store. The
+    compressed size comes straight from the object listing, while the
+    uncompressed size and CRC32 are supplied by the caller (typically from S3
+    user metadata written at upload time). All three are known before the
+    bytes are read, so the archive size stays perfectly predictable and the
+    payload is streamed through untouched: no re-compression, no full download.
+
+    Notes
+    -----
+    The payload must be a *raw* DEFLATE stream (RFC 1951), not a zlib-wrapped
+    one (RFC 1950), because that is what the ZIP specification expects for
+    compression method 8.
     """
 
-    READ_SIZE = 1024 ** 2  # 1 Mio
+    #: Read size used while streaming, in bytes.
+    READ_SIZE = 1024**2  # 1 MiB
 
-    def __init__(self, data: DataStream, size: int):
+    def __init__(
+        self,
+        data: DataStream,
+        *,
+        compressed_size: int,
+        uncompressed_size: int,
+        crc32: int,
+    ):
+        """
+        Construct the strategy.
+
+        Parameters
+        ----------
+        data
+            Stream producing the raw DEFLATE bytes.
+        compressed_size
+            Exact number of bytes the stream will yield.
+        uncompressed_size
+            Size of the payload once decompressed.
+        crc32
+            CRC32 of the uncompressed payload.
+        """
+
         self.data = data
-        self._size = size
-        self._crc32 = 0
+        self._compressed_size = compressed_size
+        self._uncompressed_size = uncompressed_size
+        self._crc32 = crc32
 
     @property
     def compressed_size(self) -> int:
-        return self._size
+        """
+        Size of the pre-compressed payload.
+
+        Returns
+        -------
+        int
+            The stored size.
+        """
+
+        return self._compressed_size
 
     @property
     def uncompressed_size(self) -> int:
-        return self._size
+        """
+        Size of the payload once decompressed.
+
+        Returns
+        -------
+        int
+            The original size.
+        """
+
+        return self._uncompressed_size
 
     @property
     def compression_method(self) -> CompressionMethod:
-        return CompressionMethod.uncompressed
+        """
+        The DEFLATE method.
+
+        Returns
+        -------
+        CompressionMethod
+            ``deflate``.
+        """
+
+        return CompressionMethod.deflate
 
     @property
     def crc32(self) -> int:
         """
-        Computed during get_data()
+        CRC32 supplied by the caller.
+
+        Returns
+        -------
+        int
+            The uncompressed payload checksum.
         """
 
         return self._crc32
 
     def get_data(self) -> Iterator[bytes]:
+        """
+        Stream the pre-compressed payload, verifying its length.
+
+        Yields
+        ------
+        bytes
+            Successive chunks of the raw DEFLATE stream.
+
+        Raises
+        ------
+        ValueError
+            If the stream yields a number of bytes different from the announced
+            ``compressed_size``. Silently producing a shorter or longer payload
+            would corrupt the archive, so this is checked explicitly.
+        """
+
+        read = 0
         self.data.open()
 
         try:
-            for _ in range(0, self.uncompressed_size, self.READ_SIZE):
-                data = self.data.read(self.READ_SIZE)
-                self._crc32 = crc32(data, self._crc32)
-                yield data
+            while read < self._compressed_size:
+                chunk = self.data.read(
+                    min(self.READ_SIZE, self._compressed_size - read)
+                )
+                if not chunk:
+                    break
+                read += len(chunk)
+                yield chunk
         finally:
             self.data.close()
-            del self.data
+
+        if read != self._compressed_size:
+            msg = (
+                f"Expected {self._compressed_size} compressed bytes but the "
+                f"stream yielded {read}"
+            )
+            raise ValueError(msg)

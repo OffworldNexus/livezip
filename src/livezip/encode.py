@@ -1,8 +1,30 @@
-from abc import ABC
-from struct import calcsize
-from typing import Any, Iterator, NamedTuple, Sequence
+"""The streaming ZIP64 encoder itself.
 
-from pendulum import DateTime
+The encoder works in three stages, all of which are exposed separately so that
+callers can inspect the predicted outcome before committing to streaming:
+
+1. :meth:`ZipEncoder.make_segments` builds the ordered list of records. Each
+   record knows its own length and how to produce its bytes.
+2. :meth:`ZipEncoder.compute_offsets` walks that list once, recording the
+   offset of every record. This is what makes the archive *predictable*: the
+   total size is known before a single payload byte is read.
+3. :meth:`ZipEncoder.get_data` iterates the records and yields their bytes.
+
+:meth:`ZipEncoder.prepare` is the shortcut that runs stages 1 and 2 and fills in
+:attr:`ZipEncoder.file_size`.
+
+The design relies on an important property of the ZIP format: an entry can be
+declared as "streamed" (general purpose bit 3), which moves the CRC and sizes
+into a trailer written *after* the payload. Everything the encoder emits before
+a payload therefore only depends on data it already has, and everything after
+it can use the checksum computed while streaming.
+"""
+
+from abc import ABC, abstractmethod
+from collections.abc import Iterator, Sequence
+from datetime import datetime
+from struct import calcsize
+from typing import Any, NamedTuple, cast
 
 from .models import (
     GP_LANGUAGES_ENCODING,
@@ -14,78 +36,116 @@ from .models import (
     Zip64EndOfCentralDirectoryLocator,
     Zip64EndOfCentralDirectoryRecord,
     Zip64ExtraField,
+    needs_zip64_sizes,
 )
 from .storage import CompactFile
 
+#: Versions advertised in the archive. 4.5 is required to read ZIP64 records.
 VERSION_NEEDED = (4, 5)
 VERSION_USED = (4, 5)
+
+#: Threshold above which a central directory value overflows its 32-bit field.
+_UINT32_MAX = 0xFFFFFFFF
 
 
 class ZipFile(NamedTuple):
     """
-    Represents a file that is going to be put in a Zip archive. It contains
-    all the information required to generate the said archive.
+    A file scheduled to be added to an archive.
+
+    Attributes
+    ----------
+    path
+        Path of the file *inside* the archive, slash-separated. It must not
+        contain a leading slash, a drive letter or ``..``.
+    data
+        Storage strategy describing how the payload is laid out.
+    modification_date
+        Timestamp stored in the entry.
+    is_binary
+        Whether the entry holds binary (as opposed to text) data.
+    comment
+        Per-entry comment.
     """
 
-    # File path within the zip, separated by slashes. Must not contain leading
-    # slash, point, drive letter, etc.
     path: str
-
-    # Storage object which will indicate file size, compression method, etc.
     data: CompactFile
-
-    # Modification date to be set in the zip
-    modification_date: DateTime
-
-    # Indicates if this file contains text or contains binary data
+    modification_date: datetime
     is_binary: bool
-
-    # A comment to attach to this file specifically
     comment: str = ""
 
 
 class Segment(ABC):
     """
-    Utility class which helps to generate the various in a streaming manner:
-    The get_length() method indicates the predicted length of the data without
-    requiring the data to be generated. Then the data can be retrieved with
-    get_data(). And finally all segments might want to query other segments,
-    this is why there is an access to the encoder object.
+    A single record of the archive.
+
+    A segment can predict its length (:meth:`get_length`), expose a hashable
+    reference so other segments can refer to it (:meth:`get_reference`), and
+    eventually yield its bytes (:meth:`get_data`). Segments are resolved against
+    the encoder, which owns the offset table.
     """
 
     def __init__(self, encoder: "ZipEncoder"):
+        """
+        Construct the segment.
+
+        Parameters
+        ----------
+        encoder
+            The encoder that owns this segment.
+        """
+
         self.encoder = encoder
 
+    @abstractmethod
     def get_length(self) -> int:
         """
-        Computes the length that this segment is going to have
+        Predict the exact length of the segment.
 
         Returns
         -------
-        Predicted length of the data
+        int
+            Number of bytes :meth:`get_data` will produce.
+
+        Raises
+        ------
+        NotImplementedError
+            Subclasses must implement this.
         """
 
         raise NotImplementedError
 
+    @abstractmethod
     def get_reference(self) -> Any:
         """
-        Generates a reference (which must be hashable) for this segment so that
-        other segments can reference it.
+        Return a hashable reference for this segment.
 
         Returns
         -------
-        Any hashable value
+        Any
+            A hashable value other segments can use to reach this one.
+
+        Raises
+        ------
+        NotImplementedError
+            Subclasses must implement this.
         """
 
         raise NotImplementedError
 
+    @abstractmethod
     def get_data(self) -> Iterator[bytes]:
         """
-        Iterates over the data chunks for this segment.
+        Yield the bytes of this segment.
 
-        Returns
-        -------
-        An iterator of all the bytes strings.
+        Yields
+        ------
+        bytes
+            Successive chunks.
+
+        Raises
+        ------
+        NotImplementedError
+            Subclasses must implement this.
         """
 
         raise NotImplementedError
@@ -93,26 +153,41 @@ class Segment(ABC):
 
 class LocalFileHeaderSegment(Segment):
     """
-    Represents the "local file header"
+    The local file header that precedes a file's payload.
     """
 
     def __init__(self, encoder: "ZipEncoder", file_id: int, file: ZipFile):
+        """
+        Construct the segment.
+
+        Parameters
+        ----------
+        encoder
+            The owning encoder.
+        file_id
+            Index of the file in the archive.
+        file
+            The file description.
+        """
+
         super().__init__(encoder)
 
         self.file_id = file_id
         self.file = file
 
     @property
-    def _struct(self):
+    def _struct(self) -> LocalFileHeader:
         """
-        We're streaming the data so at this point we don't know yet the CRC.
-        This means that we set the GP_STREAM flag, which states that CRC and
-        sizes should be zero. Anyways since we're doing ZIP64, those values
-        are useless. The CRC can be found in the data descriptor segment which
-        comes after the file as well as in the central directory entries. The
-        sizes can be found in the central directory entry as well as in the
-        data descriptor field (unless the file is too big, in which case only
-        the ZIP64 entry is reliable).
+        Build the header.
+
+        The CRC and sizes are zeroed because they are not known yet; the
+        ``GP_STREAM`` flag tells readers to look for a trailing data
+        descriptor instead.
+
+        Returns
+        -------
+        LocalFileHeader
+            The header record.
         """
 
         return LocalFileHeader(
@@ -129,23 +204,36 @@ class LocalFileHeaderSegment(Segment):
 
     def get_length(self) -> int:
         """
-        Since there is potential extra fields we can't get the length without
-        generating the data
+        Length of the packed header.
+
+        Returns
+        -------
+        int
+            The header length.
         """
 
         return len(self._struct.pack())
 
     def get_data(self) -> Iterator[bytes]:
         """
-        There's only one chunk of data here
+        Yield the packed header.
+
+        Yields
+        ------
+        bytes
+            The header, as a single chunk.
         """
 
         yield self._struct.pack()
 
     def get_reference(self) -> Any:
         """
-        Embed the file ID in the reference so that other segments regarding
-        that file can get the offset.
+        Reference this header, embedding the file id.
+
+        Returns
+        -------
+        tuple
+            The ``("file_header", file_id)`` reference.
         """
 
         return "file_header", self.file_id
@@ -153,10 +241,23 @@ class LocalFileHeaderSegment(Segment):
 
 class FileDataSegment(Segment):
     """
-    The data itself.
+    The payload of a file.
     """
 
     def __init__(self, encoder: "ZipEncoder", file_id: int, file: ZipFile):
+        """
+        Construct the segment.
+
+        Parameters
+        ----------
+        encoder
+            The owning encoder.
+        file_id
+            Index of the file in the archive.
+        file
+            The file description.
+        """
+
         super().__init__(encoder)
 
         self.file_id = file_id
@@ -165,63 +266,76 @@ class FileDataSegment(Segment):
     @property
     def crc32(self) -> int:
         """
-        Proxy to know the file's CRC32 from storage
+        Proxy the file's CRC32 from its storage strategy.
+
+        Returns
+        -------
+        int
+            The checksum.
         """
 
         return self.file.data.crc32
 
     def get_length(self) -> int:
         """
-        We rely on the information provided by the file
+        Length of the payload, as announced by the storage strategy.
+
+        Returns
+        -------
+        int
+            The payload length.
         """
 
         return self.file.data.compressed_size
 
     def get_data(self) -> Iterator[bytes]:
         """
-        Returns the raw data, simply add some checks to verify that the
-        retrieved data is exactly of the length predicted by the file's meta
-        information. If it were not to be the case, it would break the file
-        and thus an exception will be raised.
+        Stream the payload, guarding against a size mismatch.
 
-        Only once this function completed the crc32 attribute of this segment
-        will be valid.
+        If the storage yields a number of bytes different from what it
+        announced, the offsets — and therefore the whole archive — would be
+        corrupt, so an exception is raised rather than producing a broken file.
 
-        Returns
-        -------
-        An iterator of bytes contained by the file
+        Yields
+        ------
+        bytes
+            The payload chunks.
 
         Raises
         ------
         ValueError
-            If the size of read data doesn't match the size of announced data
-            then an error will arise. Cound also happen if the max file size
-            is reached.
+            If the number of bytes read differs from ``compressed_size``.
         """
 
         read = 0
 
-        # noinspection PyTypeChecker
-        for data in self.file.data.get_data():
-            read += len(data)
+        for chunk in self.file.data.get_data():
+            read += len(chunk)
 
             if read > self.file.data.compressed_size:
-                raise ValueError(f'Received too much data for "{self.file.path}"')
+                msg = f'Received too much data for "{self.file.path}"'
+                raise ValueError(msg)
 
-            if not data:
+            if not chunk:
                 return
 
-            yield data
+            yield chunk
 
         if read != self.file.data.compressed_size:
-            raise ValueError(
-                f'Received a different file size for "{self.file.path}" '
-                f"than what was announced"
+            msg = (
+                f'Received a different file size for "{self.file.path}" than '
+                f"what was announced"
             )
+            raise ValueError(msg)
 
     def get_reference(self) -> Any:
         """
-        References this data segment
+        Reference this payload, embedding the file id.
+
+        Returns
+        -------
+        tuple
+            The ``("file_data", file_id)`` reference.
         """
 
         return "file_data", self.file_id
@@ -229,15 +343,27 @@ class FileDataSegment(Segment):
 
 class DataDescriptorSegment(Segment):
     """
-    Describes the data. That's mostly useless because this doesn't handle
-    64-bits files, yet we can't have the CRC at the time of writing the header
-    so we have to set the streaming flag and thus this segment is expected even
-    if all the information is available in 64-bits in the central directory.
+    Trailer written after a payload, carrying CRC and sizes.
 
-    Long story short: this brings no information but is required for streaming.
+    It is technically redundant with the central directory, but the streaming
+    flag makes it mandatory, and it is what allows the local header to be
+    emitted before the payload has been read.
     """
 
     def __init__(self, encoder: "ZipEncoder", file_id: int, file: ZipFile):
+        """
+        Construct the segment.
+
+        Parameters
+        ----------
+        encoder
+            The owning encoder.
+        file_id
+            Index of the file in the archive.
+        file
+            The file description.
+        """
+
         super().__init__(encoder)
 
         self.file_id = file_id
@@ -245,28 +371,53 @@ class DataDescriptorSegment(Segment):
 
     def get_length(self) -> int:
         """
-        We know the length because the format is simple.
+        Length of the descriptor.
+
+        The length only depends on whether the sizes overflow 32 bits, which is
+        already known from the storage strategy, so this stays predictable.
+
+        Returns
+        -------
+        int
+            ``16`` or ``24`` bytes.
         """
 
-        return calcsize("<IIII")
+        return (
+            24
+            if needs_zip64_sizes(
+                self.file.data.compressed_size, self.file.data.uncompressed_size
+            )
+            else 16
+        )
 
     def get_data(self) -> Iterator[bytes]:
         """
-        Generates the data with the right offset to the file.
+        Yield the packed descriptor, using the freshly computed CRC.
+
+        Yields
+        ------
+        bytes
+            The descriptor, as a single chunk.
         """
 
-        file_data = self.encoder.get_segment(("file_data", self.file_id))
-        assert isinstance(file_data, FileDataSegment)
+        payload = cast(
+            "FileDataSegment", self.encoder.get_segment(("file_data", self.file_id))
+        )
 
         yield DataDescriptor(
-            crc32=file_data.crc32,
+            crc32=payload.crc32,
             compressed_size=self.file.data.compressed_size,
             uncompressed_size=self.file.data.uncompressed_size,
         ).pack()
 
     def get_reference(self) -> Any:
         """
-        References this segment
+        Reference this descriptor, embedding the file id.
+
+        Returns
+        -------
+        tuple
+            The ``("file_descriptor", file_id)`` reference.
         """
 
         return "file_descriptor", self.file_id
@@ -274,38 +425,54 @@ class DataDescriptorSegment(Segment):
 
 class CentralDirectoryFileSegment(Segment):
     """
-    Registration of a file in the central directory
+    The registration of a file in the central directory.
     """
 
     def __init__(self, encoder: "ZipEncoder", file_id: int, file: ZipFile):
+        """
+        Construct the segment.
+
+        Parameters
+        ----------
+        encoder
+            The owning encoder.
+        file_id
+            Index of the file in the archive.
+        file
+            The file description.
+        """
+
         super().__init__(encoder)
 
         self.file_id = file_id
         self.file = file
 
     @property
-    def _struct(self):
+    def _struct(self) -> CentralDirectoryFile:
         """
-        The fun thing about ZIP64 is that you must only use it when you need
-        it, meaning that you can't put the stupid extra field if nothing is
-        above the fucking limit. This gives the fancy logic with extra you can
-        see down here.
+        Build the central directory entry.
 
-        Other than that, at the moment when the data of this is being read,
-        the CRC is already computed so we can use it.
+        The ZIP64 extra field is only emitted when a value genuinely overflows
+        its 32-bit field, as the specification demands.
+
+        Returns
+        -------
+        CentralDirectoryFile
+            The entry record.
         """
 
-        file_data = self.encoder.get_segment(("file_data", self.file_id))
-        assert isinstance(file_data, FileDataSegment)
+        payload = cast(
+            "FileDataSegment", self.encoder.get_segment(("file_data", self.file_id))
+        )
 
         header_offset = self.encoder.get_offset(("file_header", self.file_id))
 
-        extra = []
+        extra: list[Zip64ExtraField] = []
 
         if (
-            self.file.data.compressed_size > 0xFFFF
-            or self.file.data.uncompressed_size > 0xFFFF
-            or header_offset > 0xFFFF
+            self.file.data.compressed_size > _UINT32_MAX
+            or self.file.data.uncompressed_size > _UINT32_MAX
+            or header_offset > _UINT32_MAX
         ):
             extra.append(
                 Zip64ExtraField(
@@ -322,7 +489,7 @@ class CentralDirectoryFileSegment(Segment):
             general_purpose=(GP_LANGUAGES_ENCODING | GP_STREAM),
             compression_method=self.file.data.compression_method,
             last_modification=self.file.modification_date,
-            crc32=file_data.crc32,
+            crc32=payload.crc32,
             compressed_size=self.file.data.compressed_size,
             uncompressed_size=self.file.data.uncompressed_size,
             file_name=self.file.path,
@@ -336,22 +503,36 @@ class CentralDirectoryFileSegment(Segment):
 
     def get_reference(self) -> Any:
         """
-        References this segment
+        Reference this entry, embedding the file id.
+
+        Returns
+        -------
+        tuple
+            The ``("cd_file", file_id)`` reference.
         """
 
         return "cd_file", self.file_id
 
     def get_length(self) -> int:
         """
-        Because of all the variable bullshit we have to compute the length
-        based on the actually generated struct.
+        Length of the packed entry.
+
+        Returns
+        -------
+        int
+            The entry length, which depends on the variable-length extras.
         """
 
         return len(self._struct.pack())
 
     def get_data(self) -> Iterator[bytes]:
         """
-        Generates and yields the segment's data in one go.
+        Yield the packed entry.
+
+        Yields
+        ------
+        bytes
+            The entry, as a single chunk.
         """
 
         yield self._struct.pack()
@@ -359,32 +540,42 @@ class CentralDirectoryFileSegment(Segment):
 
 class Zip64EndOfCentralDirectoryRecordSegment(Segment):
     """
-    Just like the ZIP version but in 64 bits. If it is not required to be
-    present then it will generate an empty output. Those zip decoders are
-    really picky, also this isn't really part of the spec to my knowledge but
-    apparently fuck you.
+    The ZIP64 end of central directory record.
+
+    It is only emitted when the 32-bit record would overflow, and produces zero
+    bytes otherwise.
     """
 
     @property
-    def is_required(self):
+    def is_required(self) -> bool:
         """
-        If any of the values is overflowing in the 32-bits version then we need
-        to output this segment but if not we need not to. This makes the test.
+        Tell whether the ZIP64 record is mandatory.
+
+        Returns
+        -------
+        bool
+            ``True`` when the entry count or either central directory offset
+            overflows the 32-bit record.
         """
 
         offset_cd = self.encoder.get_offset(("cd_file", 0))
         offset_eocd = self.encoder.get_offset("eocd64_record")
 
         return (
-            len(self.encoder.files) >= 0xFFFF
-            or offset_cd >= 0xFFFFFFFF
-            or offset_eocd >= 0xFFFFFFFF
+            len(self.encoder.files) > 0xFFFF
+            or offset_cd > _UINT32_MAX
+            or offset_eocd > _UINT32_MAX
         )
 
     @property
-    def _struct(self):
+    def _struct(self) -> Zip64EndOfCentralDirectoryRecord:
         """
-        Generates the data
+        Build the ZIP64 record.
+
+        Returns
+        -------
+        Zip64EndOfCentralDirectoryRecord
+            The record.
         """
 
         offset_cd = self.encoder.get_offset(("cd_file", 0))
@@ -403,7 +594,12 @@ class Zip64EndOfCentralDirectoryRecordSegment(Segment):
 
     def get_data(self) -> Iterator[bytes]:
         """
-        Outputs the segment only if required (see above)
+        Yield the record, unless it is not required.
+
+        Yields
+        ------
+        bytes
+            The record, or nothing.
         """
 
         if self.is_required:
@@ -411,7 +607,12 @@ class Zip64EndOfCentralDirectoryRecordSegment(Segment):
 
     def get_length(self) -> int:
         """
-        If the segment is not required, announce a 0 length
+        Length of the record, or zero when not required.
+
+        Returns
+        -------
+        int
+            The record length.
         """
 
         if self.is_required:
@@ -421,7 +622,12 @@ class Zip64EndOfCentralDirectoryRecordSegment(Segment):
 
     def get_reference(self) -> Any:
         """
-        References the segment
+        Reference this record.
+
+        Returns
+        -------
+        str
+            The ``"eocd64_record"`` reference.
         """
 
         return "eocd64_record"
@@ -429,25 +635,37 @@ class Zip64EndOfCentralDirectoryRecordSegment(Segment):
 
 class Zip64EndOfCentralDirectoryLocatorSegment(Segment):
     """
-    That segment is just there to locate the 64-bits central directory.
-    Happily, the 64-bits directory does not always appear, so this must also
-    not appear using the same condition.
+    The locator pointing at the ZIP64 end of central directory record.
+
+    It follows the exact same presence condition as the record it locates.
     """
 
     @property
-    def is_required(self):
+    def is_required(self) -> bool:
         """
-        Checks if the 64 directory appears or not
+        Tell whether the locator is mandatory.
+
+        Returns
+        -------
+        bool
+            Same value as the ZIP64 record's ``is_required``.
         """
 
-        record = self.encoder.get_segment("eocd64_record")
-        assert isinstance(record, Zip64EndOfCentralDirectoryRecordSegment)
+        record = cast(
+            "Zip64EndOfCentralDirectoryRecordSegment",
+            self.encoder.get_segment("eocd64_record"),
+        )
         return record.is_required
 
     @property
-    def _struct(self):
+    def _struct(self) -> Zip64EndOfCentralDirectoryLocator:
         """
-        Generates the data
+        Build the locator.
+
+        Returns
+        -------
+        Zip64EndOfCentralDirectoryLocator
+            The locator.
         """
 
         offset = self.encoder.get_offset("eocd64_record")
@@ -460,14 +678,24 @@ class Zip64EndOfCentralDirectoryLocatorSegment(Segment):
 
     def get_reference(self) -> Any:
         """
-        References this segment
+        Reference this locator.
+
+        Returns
+        -------
+        str
+            The ``"eocd64_locator"`` reference.
         """
 
         return "eocd64_locator"
 
     def get_length(self) -> int:
         """
-        There is only a length if required
+        Length of the locator, or zero when not required.
+
+        Returns
+        -------
+        int
+            The locator length.
         """
 
         if self.is_required:
@@ -477,7 +705,12 @@ class Zip64EndOfCentralDirectoryLocatorSegment(Segment):
 
     def get_data(self) -> Iterator[bytes]:
         """
-        No data if not required
+        Yield the locator, unless it is not required.
+
+        Yields
+        ------
+        bytes
+            The locator, or nothing.
         """
 
         if self.is_required:
@@ -486,11 +719,20 @@ class Zip64EndOfCentralDirectoryLocatorSegment(Segment):
 
 class EndOfCentralDirectoryRecordSegment(Segment):
     """
-    Indicates the end of central directory.
+    The (32-bit) end of central directory record, always present and last.
     """
 
     @property
-    def _struct(self):
+    def _struct(self) -> EndOfCentralDirectoryRecord:
+        """
+        Build the record.
+
+        Returns
+        -------
+        EndOfCentralDirectoryRecord
+            The record.
+        """
+
         offset_cd = self.encoder.get_offset(("cd_file", 0))
         offset_eocd = self.encoder.get_offset("eocd64_record")
 
@@ -505,155 +747,177 @@ class EndOfCentralDirectoryRecordSegment(Segment):
         )
 
     def get_data(self) -> Iterator[bytes]:
+        """
+        Yield the packed record.
+
+        Yields
+        ------
+        bytes
+            The record, comment included.
+        """
+
         yield self._struct.pack()
 
     def get_length(self) -> int:
+        """
+        Length of the packed record.
+
+        Returns
+        -------
+        int
+            The record length.
+        """
+
         return len(self._struct.pack())
 
     def get_reference(self) -> Any:
+        """
+        Reference this record.
+
+        Returns
+        -------
+        str
+            The ``"eocd"`` reference.
+        """
+
         return "eocd"
 
 
 class ZipEncoder:
     """
-    Encodes zips while streaming. There is basically 3 stages
+    Stream ZIP64 archives with bounded memory usage.
 
-    1. make_segments() generates all the segments required for this zip
-    2. compute_offsets() will compute the offset of all segments based on the
-       length of other segments but without generating the data itself
-    3. get_data() iterates through all the data
+    The memory footprint is :math:`O(k)` where :math:`k` is the number of files
+    (roughly one kilobyte each), independent of the combined payload size
+    :math:`n`. Execution time is :math:`O(n)`.
 
-    There is a shortcut function prepare() that does step 1 and 2. After this
-    the file_size attribute is set with the final file size, which can be
-    announced over HTTP by example.
-
-    This all works because the data is uncompressed. The choice of not
-    compressing data comes from 1. the fact that it's much simpler and you can
-    know the file size in advance and 2. because the goal of this lib is to
-    stream huge assets like video and images which can't benefit from a deflate
-    compression on top of their original compression. You might think "but
-    what about text files" but fuck text files.
-
-    In case you want to implement compression for some reason, then you're
-    pretty much in trouble. My guess is that you can't have the file size in
-    advance anymore, also you will have to re-compute the offsets a second
-    time once all files are compressed. Another option for compression would be
-    to pre-computed compressed individual files and provide a custom storage
-    method that allows to use them.
-
-    An important thing is that all segments can be queried at most times and
-    will generate an output to the best of their knowledge. Meaning that they
-    might now know the content of the files but if their offset is known then
-    they can already be generate or at least know their own length. Since the
-    zip format allows to stream data and thus allows to write data that depends
-    only on past data (for offsets or checksums) this model is pretty
-    efficient.
+    Notes
+    -----
+    The encoder deliberately does not compress anything itself. Compression is
+    the storage strategy's job, which is what keeps the output size knowable in
+    advance. For huge, already-compressed assets this is a feature; for text
+    the caller can pre-compress and use
+    :class:`livezip.storage.PrecompressedDeflate`.
     """
 
     def __init__(self, files: Sequence[ZipFile], comment: str = ""):
-        if not files:
-            raise ValueError("Unexpected empty files list")
+        """
+        Construct the encoder.
 
-        self.files = files
+        Parameters
+        ----------
+        files
+            Files to include, in order.
+        comment
+            Archive-level comment.
+
+        Raises
+        ------
+        ValueError
+            If ``files`` is empty.
+        """
+
+        if not files:
+            msg = "Unexpected empty files list"
+            raise ValueError(msg)
+
+        self.files = list(files)
         self.comment = comment
-        self.segments = None
-        self.offsets = {}
-        self.indexed_segments = {}
+        self.segments: list[Segment] = []
+        self.offsets: dict[Any, int] = {}
+        self.indexed_segments: dict[Any, Segment] = {}
         self.file_size = 0
 
     def get_segment(self, reference: Any) -> Segment:
         """
-        Returns a segment that matches a given reference. This requires the
-        offsets to have been computed to work.
+        Return a segment by reference.
 
         Parameters
         ----------
         reference
-            Reference that you want to reach
+            Reference to resolve.
 
         Returns
         -------
-        Found reference
+        Segment
+            The matching segment.
 
         Raises
         ------
         KeyError
-            If the reference is not found
+            If the reference is unknown.
         """
 
         return self.indexed_segments[reference]
 
     def get_offset(self, reference: Any) -> int:
         """
-        Returns the offset of a given reference. This requires the offsets to
-        have been computed to work.
+        Return the offset of a segment by reference.
 
         Parameters
         ----------
         reference
-            Reference whose offset you want
+            Reference to resolve.
 
         Returns
         -------
-        The offset of the reference
+        int
+            The offset of the segment.
 
         Raises
         ------
         KeyError
-            If the reference is not found
+            If the reference is unknown.
         """
 
         return self.offsets[reference]
 
     def make_segments(self) -> None:
         """
-        Generates the list of segments according to the zip specification. It's
-        pretty self-explicit.
-
-        Some ZIP64 segments are not mandatory but this is their responsibility
-        to have a 0-length output when we don't need them.
+        Build the ordered list of segments according to the ZIP specification.
         """
 
-        out = []
+        segments: list[Segment] = []
 
-        for i, file in enumerate(self.files):
-            out += [
-                LocalFileHeaderSegment(self, i, file),
-                FileDataSegment(self, i, file),
-                DataDescriptorSegment(self, i, file),
+        for file_id, file in enumerate(self.files):
+            segments += [
+                LocalFileHeaderSegment(self, file_id, file),
+                FileDataSegment(self, file_id, file),
+                DataDescriptorSegment(self, file_id, file),
             ]
 
-        for i, file in enumerate(self.files):
-            out.append(CentralDirectoryFileSegment(self, i, file))
+        for file_id, file in enumerate(self.files):
+            segments.append(CentralDirectoryFileSegment(self, file_id, file))
 
-        out += [
+        segments += [
             Zip64EndOfCentralDirectoryRecordSegment(self),
             Zip64EndOfCentralDirectoryLocatorSegment(self),
             EndOfCentralDirectoryRecordSegment(self),
         ]
 
-        self.segments = out
+        self.segments = segments
 
     def compute_offsets(self) -> None:
         """
-        Computes all the offsets of all the segments by adding the length of
-        all segments.
+        Compute every segment's offset and the total archive size.
         """
 
         offset = 0
 
         for segment in self.segments:
-            self.offsets[segment.get_reference()] = offset
-            self.indexed_segments[segment.get_reference()] = segment
+            reference = segment.get_reference()
+            self.offsets[reference] = offset
+            self.indexed_segments[reference] = segment
             offset += segment.get_length()
 
         self.file_size = offset
 
     def prepare(self) -> None:
         """
-        Runs the preliminary steps of the zip generation. After this, you
-        should have the .file_size attribute ready and you can call get_data()
-        to generate the data of the zip.
+        Run the preliminary stages.
+
+        After this call, :attr:`file_size` is populated and :meth:`get_data`
+        may be used.
         """
 
         self.make_segments()
@@ -661,9 +925,64 @@ class ZipEncoder:
 
     def get_data(self) -> Iterator[bytes]:
         """
-        Returns byte strings of various length forming the data of the zip.
+        Yield the archive bytes.
+
+        Yields
+        ------
+        bytes
+            Successive chunks forming the complete archive. Their concatenation
+            is exactly :attr:`file_size` bytes long.
         """
 
         for segment in self.segments:
-            for chunk in segment.get_data():
-                yield chunk
+            yield from segment.get_data()
+
+
+class ZippedStream(NamedTuple):
+    """
+    A prepared encoder together with its announced size.
+
+    Attributes
+    ----------
+    encoder
+        The prepared encoder.
+    size
+        Total size of the resulting archive, in bytes.
+    """
+
+    encoder: ZipEncoder
+    size: int
+
+    def iter_bytes(self) -> Iterator[bytes]:
+        """
+        Iterate over the archive bytes.
+
+        Yields
+        ------
+        bytes
+            The archive chunks.
+        """
+
+        return self.encoder.get_data()
+
+
+def build_archive(files: Sequence[ZipFile], comment: str = "") -> ZipEncoder:
+    """
+    Build and prepare a streaming archive in one call.
+
+    Parameters
+    ----------
+    files
+        Files to include.
+    comment
+        Archive-level comment.
+
+    Returns
+    -------
+    ZipEncoder
+        An encoder whose :attr:`~ZipEncoder.file_size` is already known.
+    """
+
+    encoder = ZipEncoder(files, comment)
+    encoder.prepare()
+    return encoder
