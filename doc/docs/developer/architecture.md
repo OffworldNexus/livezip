@@ -40,62 +40,11 @@ orchestrates the other pieces.
 
 ## The three phases
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Caller
-    participant Encoder as ZipEncoder
-    participant File as CompactFile
-    participant Stream as DataStream
-
-    Caller->>Encoder: new(files)
-    Caller->>Encoder: prepare()
-    Encoder->>Encoder: make_segments()
-    Note over Encoder: ordered LocalHeader / Data /<br/>Descriptor / CentralDir / EOCD records
-    Encoder->>File: compressed_size  (no read!)
-    File-->>Encoder: announced size
-    Encoder->>Encoder: compute_offsets()
-    Encoder-->>Caller: file_size is now exact
-
-    Caller->>Encoder: get_data()
-    Encoder->>Stream: open()
-    Encoder->>Stream: read()
-    Stream-->>Encoder: chunks
-    Encoder->>Stream: close()
-    Encoder-->>Caller: archive chunks
-```
-
-### Describe
-
-The caller builds a list of `ZipFile`, each carrying a `CompactFile`. Building
-this list requires no I/O. A `CompactFile` must be able to answer four questions
-without reading its payload:
-
-| Question | Property |
-| -------- | -------- |
-| How many stored bytes will you produce? | `compressed_size` |
-| How big was the original payload? | `uncompressed_size` |
-| Which ZIP compression method should I advertise? | `compression_method` |
-| What is the CRC32 of the original payload? | `crc32` |
-
-The CRC is the only one that may be answered *late* — computing it requires
-reading the bytes, so it is only read once the data has streamed through. This
-is possible precisely because of the streaming flag (see
-[the ZIP format](zip-format.md)).
-
-### Plan
-
-`prepare()` expands the file list into an ordered list of **segments** and walks
-it once, accumulating offsets. Because every segment can predict its own length
-without being materialised, the full layout — and therefore the total size — is
-known here. The walk itself is detailed in
-[the encoding pipeline](encoding-pipeline.md#2-compute_offsets).
-
-### Stream
-
-`get_data()` yields each segment's bytes in order. Payload segments pull from
-their `DataStream`, which is opened on demand and closed immediately after. Only
-one payload stream is open at a time.
+Archives are built in three steps: **describe** the files (no I/O), **plan** by
+turning them into segments and computing every offset (still no I/O), and
+**stream** the bytes. The segment-level detail lives in
+[the encoding pipeline](encoding-pipeline.md); this page covers the modules and
+guarantees around it.
 
 ## Complexity
 
