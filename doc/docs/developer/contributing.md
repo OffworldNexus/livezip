@@ -117,8 +117,9 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
-The workflow builds the sdist and wheel, publishes them to PyPI through the
-`pypi` environment, and creates the GitHub Release.
+The workflow builds the sdist and wheel with `uv build`, publishes them with
+`uv publish --trusted-publishing always` (which also uploads PEP 740
+attestations), and then creates the GitHub Release.
 
 A maintainer configures this **once** on PyPI by adding a *pending publisher*
 with these exact fields:
