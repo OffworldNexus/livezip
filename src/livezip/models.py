@@ -1,34 +1,74 @@
+"""Binary models for the ZIP and ZIP64 file formats.
+
+This module is intentionally dumb: every class knows how to serialise itself to
+bytes according to the PKZIP appnote (``zip_spec.txt``) and nothing else. The
+high-level streaming logic lives in :mod:`livezip.encode`, which stitches these
+records together without ever holding the archive in memory.
+
+All multi-byte integers are little-endian, as mandated by the specification.
+"""
+
+from datetime import UTC, datetime
 from enum import Enum
 from struct import calcsize, pack
-from typing import List, NamedTuple, Tuple, Union
+from typing import NamedTuple
 
-from pendulum import DateTime, parse
+#: DOS timestamps cannot represent dates outside this range; anything earlier
+#: is clamped up, anything later is clamped down.
+DOS_START = datetime(1980, 1, 1, tzinfo=UTC)
+DOS_STOP = datetime(2099, 12, 31, 23, 59, 59, 999999, tzinfo=UTC)
 
-DOS_START = parse("1980-01-01T00:00:00.000000Z")
-DOS_STOP = parse("2099-12-31T23:59:59.999999Z")
-
+#: General purpose bit 11: the file name is UTF-8 encoded.
 GP_LANGUAGES_ENCODING = 1 << 11
+
+#: General purpose bit 3: sizes and CRC live in a trailing data descriptor
+#: instead of the local header. Mandatory for streaming archives because the
+#: CRC is unknown until the bytes have actually been read.
 GP_STREAM = 1 << 3
 
+#: The number of bytes within a ZIP64 data descriptor is 8 for sizes.
+_UINT32_MAX = 0xFFFFFFFF
 
-def make_dos_date_time(date: DateTime) -> Tuple[int, int]:
+
+def needs_zip64_sizes(compressed_size: int, uncompressed_size: int) -> bool:
     """
-    Encodes a date/time object into the DOS binary format.
+    Tell whether sizes must be serialised on 64 bits.
+
+    Parameters
+    ----------
+    compressed_size
+        Size of the stored (possibly compressed) payload.
+    uncompressed_size
+        Size of the original payload.
+
+    Returns
+    -------
+    ``True`` when either size overflows a 32-bit field and therefore requires a
+    ZIP64 data descriptor.
+    """
+
+    return compressed_size > _UINT32_MAX or uncompressed_size > _UINT32_MAX
+
+
+def make_dos_date_time(date: datetime) -> tuple[int, int]:
+    """
+    Encode a date/time object into the DOS binary format.
 
     Parameters
     ----------
     date
-        Date to encode. It must be between DOS_START and DOS_STOP (1980 to
-        2099), otherwise it will be replaced by the closest date in range.
+        Date to encode. It must be between :data:`DOS_START` and
+        :data:`DOS_STOP` (1980 to 2099), otherwise it will be replaced by the
+        closest date in range.
 
     Returns
     -------
-        A DOS-encoded date tuple. First item is the time and second is the
-        date. As the DOS format doesn't let you set a time zone, the output is
-        in the UTC time zone.
+    tuple of int
+        A DOS-encoded ``(time, date)`` tuple. As the DOS format doesn't let you
+        set a time zone, the output is in the UTC time zone.
     """
 
-    date = date.in_timezone("UTC")
+    date = date.astimezone(UTC)
     date = max(DOS_START, date)
     date = min(DOS_STOP, date)
 
@@ -38,80 +78,82 @@ def make_dos_date_time(date: DateTime) -> Tuple[int, int]:
     return dos_time, dos_date
 
 
-def encode_version(major: int, minor: int):
+def encode_version(major: int, minor: int) -> int:
     """
-    Encodes the version number into something that the binary ZIP format
-    understands.
+    Encode a version number the way the binary ZIP format understands it.
 
     Parameters
     ----------
     major
-        Major version number (must not exceed 6553)
+        Major version number (must not exceed 6553).
     minor
-        Minor version number (must not exceed 9)
+        Minor version number (must not exceed 9).
 
     Returns
     -------
-    Encoded version number
+    int
+        Encoded version number.
 
     Raises
     ------
     ValueError
-        If the major or minor values are inadequate
+        If the major or minor values are inadequate.
     """
 
     if major < 0 or minor < 0:
-        raise ValueError(f"Negative version number was provided")
+        msg = "Negative version number was provided"
+        raise ValueError(msg)
 
     if minor >= 10:
-        raise ValueError(f'Minor "{minor}" cannot exceed 10.')
+        msg = f'Minor "{minor}" cannot exceed 10.'
+        raise ValueError(msg)
 
     version = major * 10 + minor
 
     if version > 0xFFFF:
-        raise ValueError(f"Version {major}.{minor} is too high to be encoded")
+        msg = f"Version {major}.{minor} is too high to be encoded"
+        raise ValueError(msg)
 
     return version
 
 
-def max_o(x, n, prevent=False):
+def max_o(x: int, n: int, prevent: bool = False) -> int:
     """
-    Ensures that x fits on n bits (not bytes).
-
-    - If prevent is True then an exception is raised
-    - Otherwise just set all bits to 1
+    Ensure that ``x`` fits on ``n`` bits.
 
     Parameters
     ----------
     x
-        Number to test
+        Number to test.
     n
-        Number of bits available
+        Number of bits available.
     prevent
-        If true then an exception will rise in case of overflow
+        If true then an exception will rise in case of overflow, otherwise all
+        bits are simply set to one.
 
     Returns
     -------
-    A value which fits within the bit number constraint
+    int
+        A value which fits within the bit number constraint.
 
     Raises
     ------
     ValueError
-        If the value overflows and prevent is true
+        If the value overflows and ``prevent`` is true.
     """
 
     if x >= 1 << n:
         if prevent:
-            raise ValueError
-        else:
-            return (1 << n) - 1
+            msg = f"Value {x} does not fit on {n} bits"
+            raise ValueError(msg)
+        return (1 << n) - 1
 
     return x
 
 
-def max_2(x, prevent=False):
+def max_2(x: int, prevent: bool = False) -> int:
     """
-    Fits x in 2 bytes (not bits).
+    Fit ``x`` in 2 bytes.
 
     See Also
     --------
@@ -121,9 +163,9 @@ def max_2(x, prevent=False):
     return max_o(x, 16, prevent)
 
 
-def max_4(x, prevent=False):
+def max_4(x: int, prevent: bool = False) -> int:
     """
-    Fits x in 4 bytes (not bits).
+    Fit ``x`` in 4 bytes.
 
     See Also
     --------
@@ -133,9 +175,9 @@ def max_4(x, prevent=False):
     return max_o(x, 32, prevent)
 
 
-def max_8(x, prevent=False):
+def max_8(x: int, prevent: bool = False) -> int:
     """
-    Fits x in 8 bytes (not bits).
+    Fit ``x`` in 8 bytes.
 
     See Also
     --------
@@ -147,7 +189,11 @@ def max_8(x, prevent=False):
 
 class CompressionMethod(Enum):
     """
-    Supported compression methods
+    Supported compression methods.
+
+    ``store`` copies bytes verbatim; ``deflate`` expects an RFC 1951 stream
+    (optionally a pre-compressed one, see
+    :class:`livezip.storage.PrecompressedDeflate`).
     """
 
     uncompressed = 0
@@ -156,11 +202,11 @@ class CompressionMethod(Enum):
 
 class Zip64ExtraField(NamedTuple):
     """
-    Extra field which holds the 64 bits information about a file
+    Extra field holding the 64-bit information about a file.
 
     See Also
     --------
-    Section 4.5.3 of zip_spec.txt
+    Section 4.5.3 of ``zip_spec.txt``.
     """
 
     original_size: int
@@ -168,12 +214,18 @@ class Zip64ExtraField(NamedTuple):
     header_offset: int
     disk_start: int
 
-    def pack(self):
+    def pack(self) -> bytes:
         """
-        Only the fields that need to be in 64 bits must be present, so the
-        logic here is a bit peculiar since we only add the fields that are
-        overflowing in 32-bits (thus we need to check if they overflow and then
-        append them to the output).
+        Serialise only the fields that overflow 32 bits.
+
+        The specification mandates that the ZIP64 extra field only carries the
+        fields whose 32-bit counterpart is set to ``0xFFFFFFFF``. This method
+        therefore checks each value and appends it only when needed.
+
+        Returns
+        -------
+        bytes
+            The packed extra field, header included.
         """
 
         fields = [
@@ -184,7 +236,7 @@ class Zip64ExtraField(NamedTuple):
         ]
 
         fmt = "<HH"
-        data = [0x0001, 0x0]
+        data: list[int] = [0x0001, 0x0]
 
         for value, field_fmt, length, length_64 in fields:
             if value >= (1 << length):
@@ -196,29 +248,35 @@ class Zip64ExtraField(NamedTuple):
         return pack(fmt, *data)
 
 
-ExtraField = Union[Zip64ExtraField]
-
-
 class LocalFileHeader(NamedTuple):
     """
-    Local file descriptor
+    Local file header, prepended to each file's bytes.
 
     See Also
     --------
-    Section 4.3.7 of zip_spec.txt
+    Section 4.3.7 of ``zip_spec.txt``.
     """
 
-    version_needed: Tuple[int, int]
+    version_needed: tuple[int, int]
     general_purpose: int
     compression_method: CompressionMethod
-    last_modification: DateTime
+    last_modification: datetime
     crc32: int
     compressed_size: int
     uncompressed_size: int
     file_name: str
-    extra_fields: List[ExtraField]
+    extra_fields: list[Zip64ExtraField]
 
     def pack(self) -> bytes:
+        """
+        Serialise the header.
+
+        Returns
+        -------
+        bytes
+            The packed local file header.
+        """
+
         extra = b"".join(x.pack() for x in self.extra_fields)
         file_name = self.file_name.encode("utf-8")
 
@@ -242,18 +300,53 @@ class LocalFileHeader(NamedTuple):
 
 class DataDescriptor(NamedTuple):
     """
-    Data descriptor
+    Trailer written after each streamed file.
+
+    Its sizes are 32-bit wide unless either size overflows, in which case both
+    are widened to 64 bits (see :func:`needs_zip64_sizes`).
 
     See Also
     --------
-    Section 4.3.9 of zip_spec.txt
+    Section 4.3.9 of ``zip_spec.txt``.
     """
 
     crc32: int
     compressed_size: int
     uncompressed_size: int
 
+    def packed_size(self) -> int:
+        """
+        Return the exact number of bytes :meth:`pack` will produce.
+
+        Returns
+        -------
+        int
+            ``24`` for ZIP64 descriptors, ``16`` otherwise.
+        """
+
+        if needs_zip64_sizes(self.compressed_size, self.uncompressed_size):
+            return 24
+        return 16
+
     def pack(self) -> bytes:
+        """
+        Serialise the descriptor.
+
+        Returns
+        -------
+        bytes
+            The packed data descriptor.
+        """
+
+        if needs_zip64_sizes(self.compressed_size, self.uncompressed_size):
+            return pack(
+                "<IIQQ",
+                0x08074B50,
+                self.crc32,
+                self.compressed_size,
+                self.uncompressed_size,
+            )
+
         return pack(
             "<IIII",
             0x08074B50,
@@ -265,23 +358,23 @@ class DataDescriptor(NamedTuple):
 
 class CentralDirectoryFile(NamedTuple):
     """
-    Central directory
+    One entry of the central directory that closes the archive.
 
     See Also
     --------
-    Section 4.3.12 of zip_spec.txt
+    Section 4.3.12 of ``zip_spec.txt``.
     """
 
-    version_made_by: Tuple[int, int]
-    version_needed_to_extract: Tuple[int, int]
+    version_made_by: tuple[int, int]
+    version_needed_to_extract: tuple[int, int]
     general_purpose: int
     compression_method: CompressionMethod
-    last_modification: DateTime
+    last_modification: datetime
     crc32: int
     compressed_size: int
     uncompressed_size: int
     file_name: str
-    extra_fields: List[ExtraField]
+    extra_fields: list[Zip64ExtraField]
     comment: str
     disk_number_start: int
     internal_file_attributes: int
@@ -289,6 +382,15 @@ class CentralDirectoryFile(NamedTuple):
     relative_offset_of_local_header: int
 
     def pack(self) -> bytes:
+        """
+        Serialise the central directory entry.
+
+        Returns
+        -------
+        bytes
+            The packed entry.
+        """
+
         extra = b"".join(x.pack() for x in self.extra_fields)
         file_name = self.file_name.encode("utf-8")
         comment = self.comment.encode("utf-8")
@@ -319,15 +421,15 @@ class CentralDirectoryFile(NamedTuple):
 
 class Zip64EndOfCentralDirectoryRecord(NamedTuple):
     """
-    ZIP64 end of central directory record
+    ZIP64 end of central directory record.
 
     See Also
     --------
-    Section 4.3.14 of zip_spec.txt
+    Section 4.3.14 of ``zip_spec.txt``.
     """
 
-    version_made_by: Tuple[int, int]
-    version_needed_to_extract: Tuple[int, int]
+    version_made_by: tuple[int, int]
+    version_needed_to_extract: tuple[int, int]
     number_of_this_disk: int
     number_of_the_disk_with_start: int
     number_of_entries_on_this_disk: int
@@ -336,6 +438,15 @@ class Zip64EndOfCentralDirectoryRecord(NamedTuple):
     central_directory_offset: int
 
     def pack(self) -> bytes:
+        """
+        Serialise the ZIP64 end of central directory record.
+
+        Returns
+        -------
+        bytes
+            The packed record.
+        """
+
         fmt = "<IQHHIIQQQQ"
 
         data = [
@@ -356,11 +467,11 @@ class Zip64EndOfCentralDirectoryRecord(NamedTuple):
 
 class Zip64EndOfCentralDirectoryLocator(NamedTuple):
     """
-    ZIP64 end of central directory locator
+    Locator pointing at the ZIP64 end of central directory record.
 
     See Also
     --------
-    Section 4.3.15 of zip_spec.txt
+    Section 4.3.15 of ``zip_spec.txt``.
     """
 
     number_of_the_disk_with_start: int
@@ -368,6 +479,15 @@ class Zip64EndOfCentralDirectoryLocator(NamedTuple):
     number_of_disks: int
 
     def pack(self) -> bytes:
+        """
+        Serialise the locator.
+
+        Returns
+        -------
+        bytes
+            The packed locator.
+        """
+
         data = [
             0x07064B50,
             max_4(self.number_of_the_disk_with_start, prevent=True),
@@ -380,11 +500,11 @@ class Zip64EndOfCentralDirectoryLocator(NamedTuple):
 
 class EndOfCentralDirectoryRecord(NamedTuple):
     """
-    End of central directory
+    The (32-bit) end of central directory record, always the last record.
 
     See Also
     --------
-    Section 4.3.16 of zip_spec.txt
+    Section 4.3.16 of ``zip_spec.txt``.
     """
 
     number_of_this_disk: int
@@ -396,6 +516,15 @@ class EndOfCentralDirectoryRecord(NamedTuple):
     comment: str
 
     def pack(self) -> bytes:
+        """
+        Serialise the end of central directory record.
+
+        Returns
+        -------
+        bytes
+            The packed record, comment included.
+        """
+
         comment = self.comment.encode("utf-8")
 
         data = [

@@ -1,142 +1,162 @@
 # LiveZip
 
-Memory-bound streamable implementation of ZIP64. Aimed at streaming zips full
-of multimedia assets (videos, images, etc).
+**Memory-bound, streamable ZIP64 archives.** LiveZip builds a ZIP file as an
+iterator of byte chunks, holding only a small descriptor per entry — never the
+archive, and never the payloads. It is built for the case where you have a huge
+number of already-compressed files (videos, images, logs) sitting in object
+storage and you want to hand a client a single archive *right now*.
 
-## Specifications
+[![CI](https://github.com/OffworldNexus/livezip/actions/workflows/ci.yml/badge.svg)](https://github.com/OffworldNexus/livezip/actions/workflows/ci.yml)
+[![Documentation](https://github.com/OffworldNexus/livezip/actions/workflows/deploy-docs.yml/badge.svg)](https://offworldnexus.github.io/livezip/)
 
-The requirements are the following:
+## Why LiveZip
 
-- **Memory-bound** &mdash; Given a list of N files, the memory stays bound
-  regardless of the size of each file. You can put an upper limit on memory
-  use by putting an upper limit on the number of files (the memory used for
-  each file is of the order of 1 Kio).
-- **Streamable** &mdash; The output can take in a stream of files and produce a
-  stream of data as output. You never need to write anything on disk.
-- **Predictable** &mdash; You know the size of the output file before streaming
-  it, meaning that you can announce to your client (through HTTP by example)
-  the size of what you are going to produce.
-  
-## Usage
+Three properties define the project, and everything else follows from them:
 
-### Example
-  
-An [example implementation](./__main__.py) can be used from the command line:
+- **Memory-bound** — for `k` files totalling `n` bytes, memory is `O(k)`
+  (roughly a kilobyte per file) and independent of `n`. You size the machine by
+  the *number* of files, not their weight.
+- **Streamable** — the output is an iterator of chunks. Nothing is ever fully
+  buffered, on disk or in RAM.
+- **Predictable** — the total archive size is known *before* reading a single
+  payload byte, so you can set `Content-Length` on an HTTP response and let the
+  client show real progress.
 
-```
-python -m livezip files.zip file1.txt file2.txt
-```
+This is possible because LiveZip does not compress on the fly. Compression is
+the storage strategy's job, decided up front, so the compressed size of every
+entry is known when the index is built. That is a feature for media and logs,
+which either do not compress well or are compressed already.
 
-### With Django
+## The flagship example: logs in S3 → ZIP
 
-The recommendation if you need to generate zip files on the fly using Django
-(or other Python framework) is:
-
-1. Deploy two different `gunicorn` services (each with their own pool of
-   workers). One of them will handle regular requests and the other one will
-   handle zip streaming. You can adjust the size of both worker pools according
-   to your needs
-2. Put a `nginx` (or other) in front. Create a specific routing rule that will
-   route requests either to the regular service either to the zip-dedicated
-   service
-3. Use `StreamingHttpResponse` to send your response
-
-Example:
+Say an S3 bucket holds log files that were DEFLATE-compressed at upload time,
+each carrying its original size and CRC32 in object metadata. Listing the bucket
+is then enough to build a perfectly-sized archive, and the payloads stream
+straight through — no re-compression and no extra download.
 
 ```python
-def make_zip(request: HttpRequest, ...):
-    files = [
-        ...  # your ZipFile generation here
+from livezip.s3 import create_client, list_deflate_objects, zip_from_s3
+
+client = create_client(region_name="eu-west-3")
+
+# One HEAD per object: the listing gives the compressed size, the metadata the
+# uncompressed size and CRC32. No payload is downloaded yet.
+objects = list_deflate_objects(client, "my-logs", prefix="2026/")
+
+encoder = zip_from_s3(client, "my-logs", prefix="2026/")
+print(encoder.file_size)  # the exact archive size, already known
+
+for chunk in encoder.get_data():  # only now are objects fetched, one at a time
+    response.write(chunk)
+```
+
+The same flow is available from the command line:
+
+```bash
+livezip --s3-bucket my-logs --s3-prefix 2026/ -o logs.zip
+# or straight to stdout:
+livezip --s3-bucket my-logs --s3-prefix 2026/ > logs.zip
+```
+
+A runnable, commented version lives in
+[`examples/s3_to_zip.py`](examples/s3_to_zip.py). The
+[documentation](https://offworldnexus.github.io/livezip/) walks through it in
+depth.
+
+## Install
+
+LiveZip is `uv`-managed and needs Python 3.11 or newer.
+
+```bash
+uv add livezip            # core, no dependencies
+uv add "livezip[s3]"      # with the S3 integration (boto3)
+```
+
+Or with pip:
+
+```bash
+pip install "livezip[s3]"
+```
+
+## Packing local files
+
+```bash
+livezip -o archive.zip photo.jpg video.mp4 notes.txt
+livezip -m store -o archive.zip raw.bin   # copy bytes verbatim
+```
+
+From Python:
+
+```python
+from datetime import UTC, datetime
+from pathlib import Path
+
+from livezip import FileStream, Store, ZipEncoder, ZipFile
+
+path = Path("video.mp4")
+encoder = ZipEncoder(
+    [
+        ZipFile(
+            path="video.mp4",
+            data=Store(FileStream(path), path.stat().st_size),
+            modification_date=datetime.fromtimestamp(path.stat().st_mtime, tz=UTC),
+            is_binary=True,
+        )
     ]
-
-    encoder = ZipEncoder(files)
-    encoder.prepare()
-
-    response = StreamingHttpResponse(streaming_content=encoder.get_data())
-    response["Content-Length"] = f"{encoder.file_size}"
-    response["Content-Type"] = "application/zip"
-    response["Content-Disposition"] = f"attachment; filename=example.zip"
-
-    return response
+)
+encoder.prepare()
+print(encoder.file_size)  # known before any read
 ```
 
-### Storage
+## Concepts
 
-One of the main difference between livezip and other zip libraries is that the
-user is responsible for files compression. Indeed, in order to predict the
-output file size you need to know the size of compressed data.
+| Piece | Responsibility |
+| ----- | -------------- |
+| [`ZipEncoder`](src/livezip/encode.py) | Builds the segment list, computes offsets, streams the bytes. |
+| [`storage`](src/livezip/storage.py) | Decides how a payload is laid out: `Store`, `DeflateStore`, `PrecompressedDeflate`. |
+| [`stream`](src/livezip/stream.py) | Delays opening a resource until it is read: `FileStream`, `UrlStream`, `BytesStream`. |
+| [`s3`](src/livezip/s3.py) | Turns a bucket of DEFLATE objects into a prepared encoder. |
+| [`models`](src/livezip/models.py) | Byte-exact serialisation of the ZIP/ZIP64 records. |
 
-Using this model it would be easy to actually compress files beforehand and
-then cache them, however the current implementation only provides two
-non-compressing methods.
+The `PrecompressedDeflate` strategy is the one behind the S3 example: it takes
+an existing raw DEFLATE stream plus the original size and CRC32, and passes the
+bytes through untouched.
 
-- `livezip.storage.Store` &mdash; Stores the raw uncompressed data
-- `livezip.storage.DeflateStore` &mdash; Stores the uncompressed data inside
-  DEFLATE blocks
-  
-Afterwards, all you've got to do is to provide a `livezip.storage.DataStream`
-implementation which will read all the data of the file asynchronously.
-  
-See [main.py](./__main__.py) for an example of use.
+## Testing
 
+The suite has two layers:
 
-### Data streams
+- **Unit tests** (`tests/unit`) are fast and dependency-free.
+- **End-to-end tests** (`tests/e2e`) run against a real
+  [SeaweedFS](https://github.com/seaweedfs/seaweedfs) container started with
+  [testcontainers](https://testcontainers-python.readthedocs.io/). They upload
+  logs, list them, stream a ZIP and verify every entry round-trips — the same
+  flow as production.
 
-Files are read from data streams. They must implement the
-`livezip.stream.DataStream` interface, which is loosely inspired from
-BinaryIO but is not exactly compatible. Indeed, `DataStream` objects are opened
-after they are instantiated. Example:
-
-```python
-# A BinaryIO
-f = open('/tmp/file.txt', 'r')
-
-# With a file stream
-f = UrlStream(lambda: 'https://example.com/file.txt')
-f.open()
+```bash
+make test-unit   # fast, no Docker
+make test-e2e    # needs Docker
+make test        # both
 ```
 
-This allows two things:
+CI runs the whole thing on every push, with Docker available on the runner so
+the SeaweedFS-backed tests execute for real.
 
-1. The ZipEncoder can open and close files on demand without knowing anything
-   about the resource identifier or anything of that sort. This is helpful to
-   avoid opening all your sockets at once when generating the files list
-2. You can resolve resource identifiers at opening time. By example if you sign
-   your S3 URLs to enable the download, since signatures are time-limited you
-   can delay the signature until open time to be sure that the URL didn't
-   expire
-   
-Two streams are provided:
+## Development
 
-- `livezip.stream.FileStream` &mdash; Streams the content from a file
-- `livezip.stream.UrlStream` &mdash; Streams the content from an URL
+Everything goes through `uv`; the `Makefile` is the entry point:
 
-## Complexity analysis
+```bash
+make sync        # install all dependencies (including the s3 extra)
+make clean       # format then lint (ruff) and type-check (mypy)
+make coverage    # run with a coverage report
+make docs-serve  # preview the documentation on localhost:8000
+make build       # build sdist + wheel
+```
 
-The intent of this library is to allow you to stream huge files into a zip
-without having to retain memory about said files nor about the zip's content.
-While it is mostly possible to write the zip archive in a streaming manner,
-each zip file contains an index that summarizes files position and checksum,
-meaning that this index can only be computed knowing the files content.
-Basically, you can stream the content but the index has to stay in memory. In
-any case, if you're going to generate a zip file it's likely that you will have
-to work with the files list in memory.
+Ruff rules (and their intent) are inherited from the author's other projects;
+see `[tool.ruff]` in [`pyproject.toml`](pyproject.toml).
 
-Let's consider those numbers:
+## License
 
-- `k` &mdash; Number of files in the zip
-- `n` &mdash; Combined size of all files
-
-For files big enough, the complexities are:
-
-- Memory &mdash; **O(k)**
-- Time &mdash; **O(n)**
-
-In short:
-
-- The execution time is directly proportional to how big your files are (aka
-  the in/out bandwidth available)
-- The real limit is the number of files. You need to hold the full list in RAM.
-  Also, the `prepare()` step of the encoder will take some time proportionally
-  to the number of files. **The more files you need to send simultaneously the
-  bigger machine you need.**
+WTFPL — do what the fuck you want to. See [LICENSE](LICENSE).

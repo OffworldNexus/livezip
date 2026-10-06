@@ -1,18 +1,174 @@
-[tool.poetry]
+[project]
 name = "livezip"
-version = "0.1.0"
-description = "Memory-bound streamable implementation of ZIP64. Aimed at streaming zips full of multimedia assets (videos, images, etc)."
-authors = ["Rémy Sanchez <remy.sanchez@hyperthese.net>"]
-license = "WTFPL"
+version = "0.2.0"
+description = "Memory-bound, streamable ZIP64 encoder aimed at huge media and log archives."
+readme = "README.md"
+license = { text = "WTFPL" }
+authors = [{ name = "Rémy Sanchez", email = "remy.sanchez@hyperthese.net" }]
+requires-python = ">=3.11"
+keywords = ["zip", "zip64", "streaming", "deflate", "s3", "archive"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Archiving :: Compression",
+]
+dependencies = []
 
-[tool.poetry.dependencies]
-python = "^3.6"
-pendulum = "^2.0"
+[project.optional-dependencies]
+s3 = ["boto3>=1.34"]
 
-[tool.poetry.dev-dependencies]
-black = {version = "^18.3-alpha.0", allows-prereleases = true}
-isort = {version = "^4.3"}
+[project.scripts]
+livezip = "livezip.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/OffworldNexus/livezip"
+Documentation = "https://offworldnexus.github.io/livezip/"
+Repository = "https://github.com/OffworldNexus/livezip"
+Issues = "https://github.com/OffworldNexus/livezip/issues"
+
+[dependency-groups]
+dev = [
+    "boto3>=1.34",
+    "httpx>=0.28",
+    "mypy>=1.11",
+    "pytest>=8.0",
+    "pytest-cov>=6.0",
+    "ruff>=0.14.13",
+    "testcontainers>=4.15",
+]
 
 [build-system]
-requires = ["poetry>=0.12"]
-build-backend = "poetry.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/livezip"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "README.md", "LICENSE"]
+
+# ---------------------------------------------------------------------------
+# uv
+# ---------------------------------------------------------------------------
+
+[tool.uv]
+default-groups = ["dev"]
+
+# ---------------------------------------------------------------------------
+# ruff — rules inherited from pizagram / fah
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    # -- Core --
+    "E", # pycodestyle (errors)
+    "W", # pycodestyle (warnings)
+    "F", # Pyflakes
+    "I", # isort
+    "C90", # McCabe Complexity
+    "D1", # Mandatory docstrings
+    "S", # Bandit
+
+    # -- Bonus --
+    "A", # flake8-builtins
+    "B", # flake8-bugbear
+    "DTZ", # date/time zone
+    "T10", # debugger
+    "EM", # error messages
+    "EXE", # executable
+    "G", # logging
+    "UP", # pyupgrade
+    "ASYNC", # async
+    "INP", # PEP 420
+    "T20", # no print
+    "PT", # pytest
+    "SLOT", # slots
+    "TCH", # type checking blocks
+    "PTH", # use pathlib
+    "FIX", # don't allow "not done" stuff in code
+    "ERA", # don't comment code
+    "RUF", # Ruff stuff
+    "TID251", # banned imports (see below)
+]
+
+# D104/D105/D106: package initialisers, magic methods and nested config
+# classes don't need docstrings — the surrounding module does the talking.
+ignore = ["D104", "D105", "D106", "RUF012"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests: fixtures shadow args, asserts are the point, and long expected-value
+# literals / credentials placeholders are clearer left as-is. Test functions
+# don't carry docstrings — the function name is the specification.
+"tests/**" = [
+    "ARG001",
+    "D1",
+    "INP001",
+    "S101",
+    "S105",
+    "S106",
+    "SLF001",
+    "T20",
+]
+# CLI and examples print on purpose — that's their whole job.
+"src/livezip/cli.py" = ["T20"]
+"src/livezip/__main__.py" = ["T20"]
+"examples/**" = ["E501", "T20", "INP001"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["livezip"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"requests".msg = "Use `httpx` instead, which has timeouts by default."
+
+# ---------------------------------------------------------------------------
+# mypy
+# ---------------------------------------------------------------------------
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+# boto3 is an optional extra imported lazily; we only rely on our own protocol.
+module = ["boto3", "botocore.*"]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+addopts = ["-q", "-ra", "--strict-markers", "--strict-config"]
+markers = [
+    "e2e: end-to-end tests that need Docker to run a SeaweedFS container",
+]
+filterwarnings = [
+    # boto3/botocore still emit an unactionable deprecation on import.
+    "ignore::DeprecationWarning:botocore.*",
+]
+
+[tool.coverage.run]
+source = ["livezip"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "raise NotImplementedError"]

@@ -1,0 +1,10 @@
+[project]
+name = "livezip-docs"
+version = "0.0.0"
+description = "Documentation site for livezip."
+requires-python = ">=3.11"
+dependencies = ["zensical>=0.0.60"]
+
+[tool.uv]
+# The docs tree is not a distributable package; don't try to build it.
+package = false
