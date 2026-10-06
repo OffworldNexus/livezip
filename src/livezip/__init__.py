@@ -14,7 +14,7 @@ from .encode import ZipEncoder, ZipFile, ZippedStream, build_archive
 from .storage import CompactFile, DeflateStore, PrecompressedDeflate, Store
 from .stream import BytesStream, DataStream, FileStream, UrlStream
 
-__version__ = "0.2.0"
+__version__ = "1.0.0"
 
 __all__ = [
     "BytesStream",
