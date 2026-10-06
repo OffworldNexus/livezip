@@ -15,6 +15,7 @@ archive**.
 - **Any source, mixed** — local files, HTTP URLs, in-memory buffers and S3
   objects, all through the same encoder.
 
+[![PyPI](https://img.shields.io/pypi/v/livezip)](https://pypi.org/project/livezip/)
 [![CI](https://github.com/OffworldNexus/livezip/actions/workflows/ci.yml/badge.svg)](https://github.com/OffworldNexus/livezip/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-offworldnexus.github.io-blue)](https://offworldnexus.github.io/livezip/)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://offworldnexus.github.io/livezip/developer/)
@@ -41,16 +42,6 @@ archive**.
 
 LiveZip needs Python 3.11 or newer and is managed with
 [uv](https://docs.astral.sh/uv/).
-
-> [!WARNING]
-> The 1.0 release is primed but not published. Install from the repository in
-> the meantime:
-
-```bash
-uv add "livezip[s3] @ git+https://github.com/OffworldNexus/livezip"
-```
-
-Once 1.0 is on PyPI:
 
 ```bash
 uv add livezip            # core, zero runtime dependencies
