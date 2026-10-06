@@ -107,7 +107,9 @@ data = PrecompressedDeflate(
 ```
 
 Because all three numbers are known before the stream is opened, no payload has
-to be downloaded just to plan the archive. That is the whole point.
+to be downloaded just to plan the archive. That is the whole point: the sizes
+travel in [S3 object metadata](s3-integration.md#the-metadata-contract) (or
+wherever you stored them).
 
 !!! warning "Raw DEFLATE only"
     The payload must be an RFC 1951 stream (no zlib header/trailer, RFC 1950).
@@ -115,13 +117,6 @@ to be downloaded just to plan the archive. That is the whole point.
     `zlib.compressobj(level, zlib.DEFLATED, -zlib.MAX_WBITS)` — the `-15`
     window size is what strips the zlib wrapper. `livezip.s3.compress_deflate()`
     does exactly this.
-
-### Where the metadata comes from
-
-A raw DEFLATE stream does not carry the original size or a CRC32, so they must
-travel alongside the bytes. The S3 integration stores them as object metadata at
-upload time and reads them back when listing. The full contract is documented in
-[Streaming from S3](s3-integration.md).
 
 ## Writing your own strategy
 

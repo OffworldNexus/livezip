@@ -101,5 +101,32 @@ The build backend is [hatchling](https://hatch.pypa.io/); the package uses a
 make build        # dist/livezip-<version>-py3-none-any.whl + sdist
 ```
 
-Versions live in `pyproject.toml` (and are mirrored by `livezip.__version__`).
-The changelog is the Git history; keep subjects meaningful.
+Versions live in `pyproject.toml` and are mirrored by `livezip.__version__`; a
+unit test keeps the two in sync.
+
+### Releasing
+
+Releases publish to PyPI from a Git tag using **Trusted Publishing** (OIDC), so
+no API token is stored anywhere. The tag must be `v<version>` and match
+`project.version`; the build job fails otherwise.
+
+```bash
+# 1. Set version in pyproject.toml (and livezip.__version__), then merge.
+# 2. Tag and push — this triggers .github/workflows/release.yml:
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+The workflow builds the sdist and wheel, publishes them to PyPI through the
+`pypi` environment, and creates the GitHub Release.
+
+A maintainer configures this **once** on PyPI by adding a *pending publisher*
+with these exact fields:
+
+| Field | Value |
+| ----- | ----- |
+| PyPI project name | `livezip` |
+| Owner | `OffworldNexus` |
+| Repository name | `livezip` |
+| Workflow name | `release.yml` |
+| Environment name | `pypi` |

@@ -1,6 +1,6 @@
 [project]
 name = "livezip"
-version = "0.2.0"
+version = "1.0.0"
 description = "Memory-bound, streamable ZIP64 encoder aimed at huge media and log archives."
 readme = "README.md"
 license = { text = "WTFPL" }
@@ -8,7 +8,7 @@ authors = [{ name = "Rémy Sanchez", email = "remy.sanchez@hyperthese.net" }]
 requires-python = ">=3.11"
 keywords = ["zip", "zip64", "streaming", "deflate", "s3", "archive"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",

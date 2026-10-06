@@ -61,25 +61,6 @@ Opening everything up front would be simple, but it breaks two real cases:
    UrlStream(lambda: client.generate_presigned_url(...))
    ```
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Enc as ZipEncoder
-    participant S as UrlStream
-    participant Remote as HTTP server
-
-    Note over Enc,S: describe + plan: no network
-    Enc->>Enc: prepare() ; file_size known
-    Enc->>S: open()
-    S->>Remote: GET (URL signed now)
-    loop
-        Enc->>S: read_exact(n)
-        S-->>Enc: bytes
-    end
-    Enc->>S: close()
-    S->>Remote: connection released
-```
-
 ## Writing your own
 
 Implement `open`, `read`, `close`, and make `open()` resumable (the encoder may
